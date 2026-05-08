@@ -2,21 +2,26 @@ import os
 
 
 class Config:
-    BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+    # Telegram
+    BOT_TOKEN: str = os.environ.get("BOT_TOKEN", "")
 
-    HELIUS_API_KEY = os.environ.get("HELIUS_API_KEY", "")
+    # Database
+    DATABASE_URL: str = os.environ.get("DATABASE_URL", "")
+    DB_PATH: str = os.environ.get("DB_PATH", "volume_bot.db")
 
-    RPC_URL = os.environ.get(
-        "RPC_URL",
-        f"https://mainnet.helius-rpc.com/?api-key={os.environ.get('HELIUS_API_KEY', '')}"
+    # Solana / Helius
+    HELIUS_RPC: str = os.environ.get(
+        "HELIUS_RPC",
+        "https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY"
     )
 
-    DB_PATH = os.environ.get("DB_PATH", "volume_bot.db")
+    # Optional APIs
+    BIRDEYE_API_KEY: str = os.environ.get("BIRDEYE_API_KEY", "")
+    SHYFT_API_KEY: str = os.environ.get("SHYFT_API_KEY", "")
 
-    ENCRYPTION_KEY = os.environ.get("ENCRYPTION_KEY", "")
+    # Environment
+    ENVIRONMENT: str = os.environ.get("ENVIRONMENT", "production")
 
-    DEFAULT_SLIPPAGE = int(os.environ.get("DEFAULT_SLIPPAGE", 15))
-
-    PRIORITY_FEE = float(os.environ.get("PRIORITY_FEE", 0.001))
-
-    JITO_FEE = float(os.environ.get("JITO_FEE", 0.0005))
+    # Server
+    HOST: str = os.environ.get("HOST", "0.0.0.0")
+    PORT: int = int(os.environ.get("PORT", 8080))
