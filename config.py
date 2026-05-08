@@ -9,11 +9,9 @@ class Config:
     DATABASE_URL: str = os.environ.get("DATABASE_URL", "")
     DB_PATH: str = os.environ.get("DB_PATH", "volume_bot.db")
 
-    # Solana / Helius
-    HELIUS_RPC: str = os.environ.get(
-        "HELIUS_RPC",
-        "https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY"
-    )
+    # Solana / RPC
+    HELIUS_API_KEY: str = os.environ.get("HELIUS_API_KEY", "")
+    HELIUS_RPC: str = os.environ.get("RPC_URL", "")
 
     # Optional APIs
     BIRDEYE_API_KEY: str = os.environ.get("BIRDEYE_API_KEY", "")
