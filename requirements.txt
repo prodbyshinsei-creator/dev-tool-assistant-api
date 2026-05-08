@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+requests
+base58
+solders
+cryptography
+pynacl
