@@ -5,7 +5,10 @@ from typing import List, Optional
 import logging
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
+from solders.rpc.responses import GetBalanceResp
+from solders.rpc.requests import GetBalance
 import base58
+import httpx
 
 from vamp_engine import (
     get_token_metadata, 
@@ -26,15 +29,53 @@ app = FastAPI(title="Dev Tool Assistant API")
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # В продакшене укажите конкретные домены
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Solana RPC
+SOLANA_RPC = "https://api.mainnet-beta.solana.com"
+
 # Initialize engines
 volume_engine = VolumeEngine()
 db = Database()
+
+# ==================== Helper Functions ====================
+
+async def get_sol_balance(address: str) -> float:
+    """Get SOL balance for an address from Solana RPC"""
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                SOLANA_RPC,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "getBalance",
+                    "params": [address]
+                },
+                timeout=10.0
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                if 'result' in data and 'value' in data['result']:
+                    lamports = data['result']['value']
+                    return lamports / 1_000_000_000  # Convert lamports to SOL
+            
+            return 0.0
+    except Exception as e:
+        logger.error(f"Failed to fetch balance for {address[:8]}: {e}")
+        return 0.0
+
+def generate_new_wallet():
+    """Generate a new Solana wallet"""
+    keypair = Keypair()
+    address = str(keypair.pubkey())
+    privkey = base58.b58encode(bytes(keypair)).decode('utf-8')
+    return address, privkey
 
 # ==================== Pydantic Models ====================
 
@@ -102,7 +143,7 @@ class VolumeStatsResponse(BaseModel):
 def root():
     return {
         "status": "online",
-        "version": "1.0.0",
+        "version": "1.0.1",
         "endpoints": [
             "/vamp/metadata",
             "/vamp/launch",
@@ -131,7 +172,6 @@ async def fetch_metadata(req: TokenMetadataRequest):
         if not data:
             raise HTTPException(status_code=404, detail="Token metadata not found")
         
-        # Optionally fetch market cap
         try:
             mc = get_token_market_cap(req.ca)
             if mc:
@@ -153,19 +193,16 @@ async def launch_tokens(req: LaunchTokenRequest):
     try:
         logger.info(f"Launching {req.launch_count}x tokens from CA: {req.ca}")
         
-        # Get metadata first
         meta = get_token_metadata(req.ca)
         if not meta:
             raise HTTPException(status_code=404, detail="Token metadata not found")
         
-        # Prepare metadata upload (once)
         metadata_uri = prepare_launches(meta)
         if not metadata_uri:
             raise HTTPException(status_code=500, detail="Failed to upload metadata to IPFS")
         
         logger.info(f"Metadata URI: {metadata_uri}")
         
-        # Launch tokens
         launched_tokens = []
         for i in range(req.launch_count):
             logger.info(f"Launching token {i+1}/{req.launch_count}...")
@@ -224,7 +261,6 @@ async def start_volume_session(req: VolumeStartRequest):
     try:
         logger.info(f"Starting volume session for CA: {req.ca}")
         
-        # Get wallet data with privkeys
         wallets_with_privkeys = []
         for wallet_addr in req.wallet_addresses:
             wallet_data = db.get_wallet_by_address(req.user_id, wallet_addr)
@@ -313,13 +349,6 @@ async def get_volume_status(session_id: str):
 
 # ==================== Wallet Management ====================
 
-def generate_new_wallet():
-    """Generate a new Solana wallet"""
-    keypair = Keypair()
-    address = str(keypair.pubkey())
-    privkey = base58.b58encode(bytes(keypair)).decode('utf-8')
-    return address, privkey
-
 @app.post("/wallets", response_model=WalletResponse)
 async def create_wallet(wallet: WalletCreate):
     """Add a new wallet"""
@@ -342,6 +371,9 @@ async def create_wallet(wallet: WalletCreate):
                 except Exception as e:
                     raise HTTPException(status_code=400, detail=f"Invalid private key: {str(e)}")
         
+        # Get initial balance
+        balance = await get_sol_balance(address)
+        
         wallet_id = db.add_wallet(
             user_id=wallet.user_id,
             name=wallet.name,
@@ -350,14 +382,17 @@ async def create_wallet(wallet: WalletCreate):
             wallet_type=wallet.wallet_type
         )
         
-        logger.info(f"✅ Wallet created: {wallet.name} ({address[:8]}...)")
+        # Update balance in database
+        db.update_wallet_balance(wallet.user_id, address, balance)
+        
+        logger.info(f"✅ Wallet created: {wallet.name} ({address[:8]}...) Balance: {balance} SOL")
         
         return WalletResponse(
             id=wallet_id,
             name=wallet.name,
             address=address,
             wallet_type=wallet.wallet_type,
-            balance=0.0
+            balance=balance
         )
     except HTTPException:
         raise
@@ -367,9 +402,17 @@ async def create_wallet(wallet: WalletCreate):
 
 @app.get("/wallets")
 async def list_wallets(user_id: int = 1, wallet_type: Optional[str] = None):
-    """List all wallets"""
+    """List all wallets with updated balances"""
     try:
         wallets = db.get_user_wallets(user_id, wallet_type)
+        
+        # Update balances for all wallets
+        for wallet in wallets:
+            balance = await get_sol_balance(wallet['address'])
+            wallet['balance'] = balance
+            # Update in database for caching
+            db.update_wallet_balance(user_id, wallet['address'], balance)
+        
         return {"success": True, "wallets": wallets}
     except Exception as e:
         logger.error(f"List wallets error: {e}")
@@ -380,6 +423,7 @@ async def delete_wallet(wallet_id: int, user_id: int = 1):
     """Delete a wallet"""
     try:
         db.delete_wallet(user_id, wallet_id)
+        logger.info(f"✅ Wallet deleted: ID {wallet_id}")
         return {"success": True, "message": "Wallet deleted"}
     except Exception as e:
         logger.error(f"Delete wallet error: {e}")
@@ -387,11 +431,17 @@ async def delete_wallet(wallet_id: int, user_id: int = 1):
 
 @app.get("/wallets/{wallet_id}")
 async def get_wallet(wallet_id: int, user_id: int = 1):
-    """Get wallet details"""
+    """Get wallet details with updated balance"""
     try:
         wallet = db.get_wallet(user_id, wallet_id)
         if not wallet:
             raise HTTPException(status_code=404, detail="Wallet not found")
+        
+        # Update balance
+        balance = await get_sol_balance(wallet['address'])
+        wallet['balance'] = balance
+        db.update_wallet_balance(user_id, wallet['address'], balance)
+        
         return {"success": True, "wallet": wallet}
     except HTTPException:
         raise

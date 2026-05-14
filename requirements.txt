@@ -3,6 +3,7 @@ uvicorn[standard]
 pydantic
 python-multipart
 requests
+httpx
 base58
 solders
 cryptography
