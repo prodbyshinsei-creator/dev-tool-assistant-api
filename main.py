@@ -143,7 +143,7 @@ class VolumeStatsResponse(BaseModel):
 def root():
     return {
         "status": "online",
-        "version": "1.0.1",
+        "version": "1.0.2",
         "endpoints": [
             "/vamp/metadata",
             "/vamp/launch",
