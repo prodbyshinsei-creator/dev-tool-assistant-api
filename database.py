@@ -1,208 +1,368 @@
 import sqlite3
-import os
-from typing import List, Dict, Optional
-from cryptography.fernet import Fernet
-import requests
+import logging
+from typing import Optional, List, Dict
+from datetime import datetime
 
-DB_PATH = os.environ.get("DB_PATH", "/tmp/volume_bot.db")
-
-def _get_cipher():
-    key = os.environ.get("ENCRYPT_KEY", "")
-    if not key:
-        raise ValueError("ENCRYPT_KEY not set")
-    return Fernet(key.encode())
-
-def _get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
-
-def _init_db():
-    conn = _get_conn()
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS wallets (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            address TEXT NOT NULL,
-            name TEXT NOT NULL,
-            private_key_enc TEXT NOT NULL,
-            wallet_type TEXT NOT NULL DEFAULT 'volume',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(user_id, address, wallet_type)
-        );
-
-        CREATE TABLE IF NOT EXISTS launches (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            original_ca TEXT NOT NULL,
-            launched_ca TEXT,
-            name TEXT,
-            ticker TEXT,
-            description TEXT,
-            image_url TEXT,
-            website TEXT,
-            twitter TEXT,
-            telegram TEXT,
-            dev_wallet TEXT NOT NULL,
-            dev_buy_sol REAL NOT NULL,
-            launch_num INTEGER NOT NULL,
-            status TEXT DEFAULT 'active',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-    """)
-    conn.commit()
-    conn.close()
-
-_init_db()
-
-def get_sol_balance(address: str) -> Optional[float]:
-    try:
-        rpc = os.environ.get("HELIUS_RPC", "")
-        if not rpc:
-            return None
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getBalance",
-            "params": [address]
-        }
-        resp = requests.post(rpc, json=payload, timeout=5)
-        result = resp.json()
-        if "result" in result:
-            lamports = result["result"]["value"]
-            return lamports / 1_000_000_000
-        return None
-    except Exception:
-        return None
+logger = logging.getLogger(__name__)
 
 class Database:
-    # ── WALLETS ───────────────────────────────────────────────────────────────
-
-    def get_wallets(self, user_id: int, wallet_type: str = 'volume') -> List[Dict]:
-        conn = _get_conn()
-        try:
-            cur = conn.execute(
-                "SELECT address, name, wallet_type FROM wallets WHERE user_id = ? AND wallet_type = ? ORDER BY created_at",
-                (user_id, wallet_type)
+    def __init__(self, db_path: str = "dev_tool_assistant.db"):
+        self.db_path = db_path
+        self.init_db()
+    
+    def get_connection(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+    
+    def init_db(self):
+        """Initialize database tables"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        # Wallets table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS wallets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                address TEXT NOT NULL,
+                privkey TEXT NOT NULL,
+                wallet_type TEXT NOT NULL,
+                balance REAL DEFAULT 0.0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-            return [dict(row) for row in cur.fetchall()]
-        finally:
-            conn.close()
-
-    def get_wallets_with_balance(self, user_id: int, wallet_type: str = 'volume') -> List[Dict]:
-        wallets = self.get_wallets(user_id, wallet_type)
-        result = []
-        for w in wallets:
-            balance = get_sol_balance(w['address'])
-            result.append({**w, 'balance': balance})
-        return result
-
+        """)
+        
+        # Volume sessions table (for history)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS volume_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL UNIQUE,
+                user_id INTEGER NOT NULL,
+                ca TEXT NOT NULL,
+                wallets_count INTEGER,
+                min_sol REAL,
+                max_sol REAL,
+                total_txs INTEGER DEFAULT 0,
+                total_fees REAL DEFAULT 0.0,
+                started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                stopped_at TIMESTAMP
+            )
+        """)
+        
+        # Launched tokens table (for history)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS launched_tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                original_ca TEXT NOT NULL,
+                cloned_ca TEXT NOT NULL,
+                name TEXT,
+                ticker TEXT,
+                dev_buy_sol REAL,
+                dev_wallet_address TEXT,
+                launched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        conn.commit()
+        conn.close()
+        logger.info(f"Database initialized at {self.db_path}")
+    
+    # ==================== Wallet Methods ====================
+    
+    def add_wallet(
+        self,
+        user_id: int,
+        name: str,
+        address: str,
+        privkey: str,
+        wallet_type: str
+    ) -> int:
+        """Add a new wallet and return its ID"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            INSERT INTO wallets (user_id, name, address, privkey, wallet_type)
+            VALUES (?, ?, ?, ?, ?)
+        """, (user_id, name, address, privkey, wallet_type))
+        
+        wallet_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        
+        logger.info(f"Added wallet: {name} ({address[:8]}...) type={wallet_type}")
+        return wallet_id
+    
+    def get_user_wallets(
+        self,
+        user_id: int,
+        wallet_type: Optional[str] = None
+    ) -> List[Dict]:
+        """Get all wallets for a user"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        if wallet_type:
+            cursor.execute("""
+                SELECT id, name, address, wallet_type, balance, created_at
+                FROM wallets
+                WHERE user_id = ? AND wallet_type = ?
+                ORDER BY created_at DESC
+            """, (user_id, wallet_type))
+        else:
+            cursor.execute("""
+                SELECT id, name, address, wallet_type, balance, created_at
+                FROM wallets
+                WHERE user_id = ?
+                ORDER BY created_at DESC
+            """, (user_id,))
+        
+        rows = cursor.fetchall()
+        conn.close()
+        
+        wallets = []
+        for row in rows:
+            wallets.append({
+                'id': row['id'],
+                'name': row['name'],
+                'address': row['address'],
+                'wallet_type': row['wallet_type'],
+                'balance': row['balance'],
+                'created_at': row['created_at']
+            })
+        
+        return wallets
+    
+    def get_wallet(self, user_id: int, wallet_id: int) -> Optional[Dict]:
+        """Get specific wallet by ID"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT id, name, address, wallet_type, balance, created_at
+            FROM wallets
+            WHERE user_id = ? AND id = ?
+        """, (user_id, wallet_id))
+        
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row:
+            return {
+                'id': row['id'],
+                'name': row['name'],
+                'address': row['address'],
+                'wallet_type': row['wallet_type'],
+                'balance': row['balance'],
+                'created_at': row['created_at']
+            }
+        return None
+    
+    def get_wallet_by_address(self, user_id: int, address: str) -> Optional[Dict]:
+        """Get wallet by address"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT id, name, address, privkey, wallet_type, balance
+            FROM wallets
+            WHERE user_id = ? AND address = ?
+        """, (user_id, address))
+        
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row:
+            return {
+                'id': row['id'],
+                'name': row['name'],
+                'address': row['address'],
+                'privkey': row['privkey'],
+                'wallet_type': row['wallet_type'],
+                'balance': row['balance']
+            }
+        return None
+    
     def get_wallet_privkey(self, user_id: int, address: str) -> Optional[str]:
-        conn = _get_conn()
-        try:
-            cur = conn.execute(
-                "SELECT private_key_enc FROM wallets WHERE user_id = ? AND address = ?",
-                (user_id, address)
-            )
-            row = cur.fetchone()
-            if not row:
-                return None
-            cipher = _get_cipher()
-            return cipher.decrypt(row["private_key_enc"].encode()).decode()
-        finally:
-            conn.close()
-
-    def add_wallet(self, user_id: int, address: str, name: str, private_key: str, wallet_type: str = 'volume') -> bool:
-        conn = _get_conn()
-        try:
-            cipher = _get_cipher()
-            enc = cipher.encrypt(private_key.encode()).decode()
-            conn.execute(
-                "INSERT OR REPLACE INTO wallets (user_id, address, name, private_key_enc, wallet_type) VALUES (?, ?, ?, ?, ?)",
-                (user_id, address, name, enc, wallet_type)
-            )
-            conn.commit()
-            return True
-        except Exception:
-            conn.rollback()
-            return False
-        finally:
-            conn.close()
-
-    def delete_wallet(self, user_id: int, address: str, wallet_type: str = 'volume') -> bool:
-        conn = _get_conn()
-        try:
-            cur = conn.execute(
-                "DELETE FROM wallets WHERE user_id = ? AND address = ? AND wallet_type = ?",
-                (user_id, address, wallet_type)
-            )
-            conn.commit()
-            return cur.rowcount > 0
-        finally:
-            conn.close()
-
-    # ── LAUNCHES ──────────────────────────────────────────────────────────────
-
-    def add_launch(self, user_id: int, original_ca: str, dev_wallet: str,
-                   dev_buy_sol: float, launch_num: int, meta: dict) -> int:
-        conn = _get_conn()
-        try:
-            cur = conn.execute(
-                """INSERT INTO launches
-                   (user_id, original_ca, name, ticker, description, image_url,
-                    website, twitter, telegram, dev_wallet, dev_buy_sol, launch_num)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (user_id, original_ca,
-                 meta.get('name'), meta.get('ticker'), meta.get('description'),
-                 meta.get('image_url'), meta.get('website'), meta.get('twitter'),
-                 meta.get('telegram'), dev_wallet, dev_buy_sol, launch_num)
-            )
-            conn.commit()
-            return cur.lastrowid
-        finally:
-            conn.close()
-
-    def update_launch_ca(self, launch_id: int, launched_ca: str):
-        conn = _get_conn()
-        try:
-            conn.execute(
-                "UPDATE launches SET launched_ca = ? WHERE id = ?",
-                (launched_ca, launch_id)
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-    def get_active_launches(self, user_id: int) -> List[Dict]:
-        conn = _get_conn()
-        try:
-            cur = conn.execute(
-                "SELECT * FROM launches WHERE user_id = ? AND status = 'active' ORDER BY launch_num",
-                (user_id,)
-            )
-            return [dict(row) for row in cur.fetchall()]
-        finally:
-            conn.close()
-
-    def close_launch(self, launch_id: int):
-        conn = _get_conn()
-        try:
-            conn.execute(
-                "UPDATE launches SET status = 'closed' WHERE id = ?",
-                (launch_id,)
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-    def close_all_launches(self, user_id: int):
-        conn = _get_conn()
-        try:
-            conn.execute(
-                "UPDATE launches SET status = 'closed' WHERE user_id = ? AND status = 'active'",
-                (user_id,)
-            )
-            conn.commit()
-        finally:
-            conn.close()
+        """Get private key for a wallet"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT privkey FROM wallets
+            WHERE user_id = ? AND address = ?
+        """, (user_id, address))
+        
+        row = cursor.fetchone()
+        conn.close()
+        
+        return row['privkey'] if row else None
+    
+    def delete_wallet(self, user_id: int, wallet_id: int):
+        """Delete a wallet"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            DELETE FROM wallets
+            WHERE user_id = ? AND id = ?
+        """, (user_id, wallet_id))
+        
+        conn.commit()
+        conn.close()
+        logger.info(f"Deleted wallet ID: {wallet_id}")
+    
+    def update_wallet_balance(self, user_id: int, address: str, balance: float):
+        """Update wallet balance"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            UPDATE wallets
+            SET balance = ?
+            WHERE user_id = ? AND address = ?
+        """, (balance, user_id, address))
+        
+        conn.commit()
+        conn.close()
+    
+    # ==================== Volume Session Methods ====================
+    
+    def save_volume_session(
+        self,
+        session_id: str,
+        user_id: int,
+        ca: str,
+        wallets_count: int,
+        min_sol: float,
+        max_sol: float
+    ):
+        """Save volume session to history"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            INSERT INTO volume_sessions 
+            (session_id, user_id, ca, wallets_count, min_sol, max_sol)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (session_id, user_id, ca, wallets_count, min_sol, max_sol))
+        
+        conn.commit()
+        conn.close()
+    
+    def update_volume_session_stats(
+        self,
+        session_id: str,
+        total_txs: int,
+        total_fees: float
+    ):
+        """Update session stats"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            UPDATE volume_sessions
+            SET total_txs = ?, total_fees = ?, stopped_at = CURRENT_TIMESTAMP
+            WHERE session_id = ?
+        """, (total_txs, total_fees, session_id))
+        
+        conn.commit()
+        conn.close()
+    
+    def get_volume_sessions(self, user_id: int, limit: int = 10) -> List[Dict]:
+        """Get volume session history"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT * FROM volume_sessions
+            WHERE user_id = ?
+            ORDER BY started_at DESC
+            LIMIT ?
+        """, (user_id, limit))
+        
+        rows = cursor.fetchall()
+        conn.close()
+        
+        sessions = []
+        for row in rows:
+            sessions.append(dict(row))
+        
+        return sessions
+    
+    # ==================== Launched Tokens Methods ====================
+    
+    def save_launched_token(
+        self,
+        user_id: int,
+        original_ca: str,
+        cloned_ca: str,
+        name: str,
+        ticker: str,
+        dev_buy_sol: float,
+        dev_wallet_address: str
+    ):
+        """Save launched token to history"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            INSERT INTO launched_tokens
+            (user_id, original_ca, cloned_ca, name, ticker, dev_buy_sol, dev_wallet_address)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (user_id, original_ca, cloned_ca, name, ticker, dev_buy_sol, dev_wallet_address))
+        
+        conn.commit()
+        conn.close()
+        logger.info(f"Saved launched token: {ticker} ({cloned_ca[:8]}...)")
+    
+    def get_launched_tokens(self, user_id: int, limit: int = 50) -> List[Dict]:
+        """Get launch history"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT * FROM launched_tokens
+            WHERE user_id = ?
+            ORDER BY launched_at DESC
+            LIMIT ?
+        """, (user_id, limit))
+        
+        rows = cursor.fetchall()
+        conn.close()
+        
+        tokens = []
+        for row in rows:
+            tokens.append(dict(row))
+        
+        return tokens
+    
+    # ==================== Utility Methods ====================
+    
+    def get_wallet_count(self, user_id: int, wallet_type: Optional[str] = None) -> int:
+        """Get total wallet count"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        if wallet_type:
+            cursor.execute("""
+                SELECT COUNT(*) as count FROM wallets
+                WHERE user_id = ? AND wallet_type = ?
+            """, (user_id, wallet_type))
+        else:
+            cursor.execute("""
+                SELECT COUNT(*) as count FROM wallets
+                WHERE user_id = ?
+            """, (user_id,))
+        
+        row = cursor.fetchone()
+        conn.close()
+        
+        return row['count'] if row else 0
+    
+    def close(self):
+        """Close database (cleanup method)"""
+        pass  # SQLite doesn't need explicit close for file-based DB
