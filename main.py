@@ -3,6 +3,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 import logging
+from solders.keypair import Keypair
+from solders.pubkey import Pubkey
+import base58
+
 from vamp_engine import (
     get_token_metadata, 
     get_token_market_cap,
@@ -63,8 +67,8 @@ class SellTokenRequest(BaseModel):
 
 class WalletCreate(BaseModel):
     name: str
-    address: str
-    privkey: str
+    address: Optional[str] = None
+    privkey: Optional[str] = None
     wallet_type: str  # 'dev' or 'volume'
     user_id: int = 1
 
@@ -309,27 +313,56 @@ async def get_volume_status(session_id: str):
 
 # ==================== Wallet Management ====================
 
+def generate_new_wallet():
+    """Generate a new Solana wallet"""
+    keypair = Keypair()
+    address = str(keypair.pubkey())
+    privkey = base58.b58encode(bytes(keypair)).decode('utf-8')
+    return address, privkey
+
 @app.post("/wallets", response_model=WalletResponse)
 async def create_wallet(wallet: WalletCreate):
     """Add a new wallet"""
     try:
+        # If privkey not provided, generate new wallet
+        if not wallet.privkey or not wallet.address:
+            logger.info(f"Generating new wallet for: {wallet.name}")
+            address, privkey = generate_new_wallet()
+        else:
+            # Use provided privkey
+            address = wallet.address
+            privkey = wallet.privkey
+            
+            # If address not provided but privkey is, derive address from privkey
+            if not address and privkey:
+                try:
+                    decoded = base58.b58decode(privkey)
+                    keypair = Keypair.from_bytes(decoded)
+                    address = str(keypair.pubkey())
+                except Exception as e:
+                    raise HTTPException(status_code=400, detail=f"Invalid private key: {str(e)}")
+        
         wallet_id = db.add_wallet(
             user_id=wallet.user_id,
             name=wallet.name,
-            address=wallet.address,
-            privkey=wallet.privkey,
+            address=address,
+            privkey=privkey,
             wallet_type=wallet.wallet_type
         )
+        
+        logger.info(f"✅ Wallet created: {wallet.name} ({address[:8]}...)")
         
         return WalletResponse(
             id=wallet_id,
             name=wallet.name,
-            address=wallet.address,
+            address=address,
             wallet_type=wallet.wallet_type,
             balance=0.0
         )
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Create wallet error: {e}")
+        logger.error(f"Create wallet error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/wallets")
