@@ -1,5 +1,7 @@
 fastapi
-uvicorn
+uvicorn[standard]
+pydantic
+python-multipart
 requests
 base58
 solders
